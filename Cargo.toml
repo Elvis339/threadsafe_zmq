@@ -8,6 +8,7 @@ readme = "README.md"
 keywords = ["threadsafe", "zeromq", "sockets", "unix-domain-sockets", "ipc"]
 categories = ["concurrency"]
 repository = "https://github.com/Elvis339/threadsafe_zmq"
+license = "Apache-2.0"
 
 [dependencies]
 zmq = "0.10.0"
