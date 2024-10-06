@@ -1,89 +1,42 @@
-use anyhow::anyhow;
-use crossbeam_channel::{select, unbounded, Receiver, Sender};
+mod error;
+
+use crossbeam_channel::{
+    select, unbounded, Receiver as CrossbeamReceiver, Sender as CrossbeamSender,
+};
+use error::ChannelPairError;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
-use zmq::{Context, PollEvents, Socket, SocketType};
+use zmq::{Context, PollEvents, Socket};
 
 static UNIQUE_INDEX: AtomicU16 = AtomicU16::new(0);
 const IN: usize = 0;
 const OUT: usize = 1;
-const DEFAULT_LINGER_TIME: i32 = 30;
 
-type ZmqByteStream = Vec<Vec<u8>>;
+pub type ZmqByteStream = Vec<Vec<u8>>;
+pub type Sender = CrossbeamSender<ZmqByteStream>;
+pub type Receiver = CrossbeamReceiver<ZmqByteStream>;
 
-struct ChannelPair {
-    ctx: Context,
+pub struct ChannelPair {
     z_sock: Socket,
     z_tx: Vec<Socket>,
     z_control: Vec<Socket>,
-    tx_chan: Sender<ZmqByteStream>,
-    rx_chan: Receiver<ZmqByteStream>,
-    error_chan: (Sender<anyhow::Error>, Receiver<anyhow::Error>),
-    control_chan: (Sender<bool>, Receiver<bool>),
+    tx_chan: Sender,
+    rx_chan: Receiver,
+    error_chan: (
+        CrossbeamSender<ChannelPairError>,
+        CrossbeamReceiver<ChannelPairError>,
+    ),
+    control_chan: (CrossbeamSender<bool>, CrossbeamReceiver<bool>),
 }
 
-impl Clone for ChannelPair {
-    // Avoid calling clone!!!
-    fn clone(&self) -> Self {
-        let socket_type = self.z_sock.get_socket_type().unwrap();
-        let last_endpoint = self.z_sock.get_last_endpoint().unwrap().unwrap();
-        Self::disconnect_socket(&self.z_sock).unwrap();
+enum SocketState {
+    Idle,
+    ReadyToSend(ZmqByteStream),
+}
 
-        for z_tx_socket in self.z_tx.iter() {
-            Self::disconnect_socket(z_tx_socket).unwrap();
-        }
-
-        for z_control_socket in self.z_control.iter() {
-            Self::disconnect_socket(z_control_socket).unwrap();
-        }
-
-        let z_tx = Self::new_pair(&self.ctx).unwrap();
-        let z_control = Self::new_pair(&self.ctx).unwrap();
-
-        let new_socket = self.ctx.socket(socket_type).unwrap();
-
-        new_socket.set_rcvtimeo(0).unwrap();
-        new_socket.set_sndtimeo(0).unwrap();
-
-        match socket_type {
-            SocketType::PUB
-            | SocketType::REP
-            | SocketType::PUSH
-            | SocketType::XPUB
-            | SocketType::ROUTER => {
-                new_socket.bind(&last_endpoint).unwrap();
-            }
-            SocketType::SUB
-            | SocketType::REQ
-            | SocketType::DEALER
-            | SocketType::PULL
-            | SocketType::XSUB
-            | SocketType::STREAM => {
-                new_socket.connect(&last_endpoint).unwrap();
-            }
-            // Special handling for PAIR socket (try bind first, then connect if it fails)
-            SocketType::PAIR => match new_socket.bind(&last_endpoint) {
-                Ok(_) => {}
-                Err(_) => {
-                    new_socket.connect(&last_endpoint).unwrap();
-                }
-            },
-        }
-
-        let mut cp = Self {
-            ctx: self.ctx.clone(),
-            z_sock: new_socket,
-            tx_chan: self.tx_chan.clone(),
-            rx_chan: self.rx_chan.clone(),
-            error_chan: self.error_chan.clone(),
-            control_chan: self.control_chan.clone(),
-            z_tx,
-            z_control,
-        };
-
-        Self::configure_socket(&mut cp).unwrap();
-
-        cp
+impl SocketState {
+    fn reset(&mut self) {
+        *self = SocketState::Idle;
     }
 }
 
@@ -91,28 +44,25 @@ unsafe impl Send for ChannelPair {}
 unsafe impl Sync for ChannelPair {}
 
 impl ChannelPair {
-    pub fn new(ctx: Context, socket: Socket) -> anyhow::Result<Arc<Self>> {
-        let z_tx = Self::new_pair(&ctx)?;
-        let z_control = Self::new_pair(&ctx)?;
+    pub fn new(socket: Socket) -> Result<Arc<Self>, ChannelPairError> {
+        let z_tx = Self::new_pair()?;
+        let z_control = Self::new_pair()?;
 
         let (tx_chan, rx_chan) = unbounded::<ZmqByteStream>();
 
         let mut channel_pair = Self {
-            ctx,
             z_tx,
             z_control,
             tx_chan,
             rx_chan,
             z_sock: socket,
-            error_chan: unbounded::<anyhow::Error>(),
+            error_chan: unbounded::<ChannelPairError>(),
             control_chan: unbounded::<bool>(),
         };
         Self::configure_socket(&mut channel_pair)?;
-
-        // let tmp = channel_pair.clone();
         let channel_pair = Arc::new(channel_pair);
 
-        // === run sockets ==={
+        // === run sockets ===
         let channel_pair_clone = Arc::clone(&channel_pair);
         std::thread::spawn(move || channel_pair_clone.run_sockets());
 
@@ -124,114 +74,87 @@ impl ChannelPair {
     }
 
     fn run_sockets(&self) {
-        let mut to_xmit: ZmqByteStream = vec![];
+        let mut state = SocketState::Idle;
 
-        // Create poll items array.
         let mut items = [
-            self.z_sock.as_poll_item(PollEvents::empty()),
-            self.z_tx[OUT].as_poll_item(PollEvents::empty()),
-            self.z_control[OUT].as_poll_item(zmq::POLLIN),
+            self.z_sock.as_poll_item(PollEvents::empty()), // z_sock for reading incoming messages
+            self.z_tx[OUT].as_poll_item(PollEvents::empty()), // z_tx[OUT] for receiving messages from `z_tx[IN]`
+            self.z_control[OUT].as_poll_item(PollEvents::empty()), // z_control for handling control messages
         ];
 
         loop {
-            let mut z_sock_flag = PollEvents::empty();
-            let mut tx_sock_flag = PollEvents::empty();
+            // Set events to monitor based on the state
+            items[0].set_events(match state {
+                SocketState::ReadyToSend(_) => zmq::POLLOUT, // If we have data to send, poll for writable events
+                _ => zmq::POLLIN, // If we have no data to send, poll for readable events
+            });
 
-            if to_xmit.is_empty() {
-                tx_sock_flag |= zmq::POLLIN;
-            } else {
-                z_sock_flag |= zmq::POLLOUT;
-            }
+            items[1].set_events(match state {
+                SocketState::Idle => zmq::POLLIN, // Poll for messages from `z_tx[OUT]` only when idle
+                _ => PollEvents::empty(),         // No need to poll if we're in a different state
+            });
 
-            items[0].set_events(z_sock_flag);
-            items[1].set_events(tx_sock_flag);
-
-            // Pass the whole `items` array as a mutable reference.
             match zmq::poll(&mut items, -1) {
                 Ok(_) => {
+                    // Check if `z_sock` is readable or writable
                     if items[0].is_readable() {
                         match self.z_sock.recv_multipart(0) {
-                            Ok(zmq_byte_stream) => self.tx_chan().send(zmq_byte_stream).unwrap(),
-                            Err(recv_err) => {
-                                self.on_err(anyhow!(
-                                    "Failed to receive message on the socket: {:?}",
-                                    recv_err
-                                ));
-                                return;
-                            }
-                        }
-                    }
-
-                    if items[0].is_writable() && !to_xmit.is_empty() {
-                        match self.z_sock.send_multipart(to_xmit.clone(), 0) {
-                            Ok(_) => {
-                                to_xmit = vec![];
-                            }
-                            Err(snd_err) => {
-                                self.on_err(anyhow!(
-                                    "Failed to send message on the socket: {:?}",
-                                    snd_err
-                                ));
-                                return;
-                            }
-                        }
-                    }
-
-                    if items[1].is_readable() && to_xmit.is_empty() {
-                        match self.z_tx[OUT].recv_multipart(0) {
                             Ok(zmq_byte_stream) => {
-                                to_xmit = zmq_byte_stream;
-                            }
-                            Err(z_tx_recv_err) => {
-                                self.on_err(anyhow!(
-                                    "Failed to receive message on the tx socket: {:?}",
-                                    z_tx_recv_err
-                                ));
-                                return;
-                            }
-                        }
-                    }
-
-                    if items[2].is_writable() {
-                        match self.z_control[OUT].recv_multipart(0) {
-                            Ok(_) => {}
-                            Err(ctrl_err) => {
-                                self.on_err(anyhow!(
-                                    "Failed to receive message on the control socket: {:?}",
-                                    ctrl_err
-                                ));
-                                return;
-                            }
-                        }
-
-                        let linger = self.z_sock.get_linger().unwrap_or(DEFAULT_LINGER_TIME);
-                        if let Err(err) = self.z_sock.set_linger(linger) {
-                            self.on_err(anyhow!("Failed to set linger on the socket: {:?}", err));
-                            return;
-                        }
-
-                        if !to_xmit.is_empty() {
-                            match self.z_sock.send_multipart(to_xmit.clone(), 0) {
-                                Ok(_) => {}
-                                Err(snd_err) => {
-                                    self.on_err(anyhow!(
-                                        "Failed to send pending message on the socket: {:?}",
-                                        snd_err
-                                    ));
+                                if let Err(err) = self.tx_chan().send(zmq_byte_stream) {
+                                    self.on_err(ChannelPairError::ChannelError(format!(
+                                        "Failed to send message to channel: {:?}",
+                                        err
+                                    )));
                                     return;
                                 }
                             }
-                        } else {
-                            to_xmit = vec![];
+                            Err(recv_err) => {
+                                self.on_err(ChannelPairError::Zmq(recv_err));
+                                return;
+                            }
                         }
+                    }
 
-                        items[2].set_events(PollEvents::empty());
-                        items[0].set_events(PollEvents::empty());
-                        items[1].set_events(zmq::POLLIN);
+                    if items[0].is_writable() {
+                        if let SocketState::ReadyToSend(message) = &state {
+                            match self.z_sock.send_multipart(message.clone(), 0) {
+                                Ok(_) => {
+                                    state.reset();
+                                }
+                                Err(snd_err) => {
+                                    self.on_err(ChannelPairError::Zmq(snd_err));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    // Check if there's a message in the transmit socket (`z_tx[OUT]`)
+                    if items[1].is_readable() {
+                        match self.z_tx[OUT].recv_multipart(0) {
+                            Ok(zmq_byte_stream) => {
+                                state = SocketState::ReadyToSend(zmq_byte_stream);
+                            }
+                            Err(z_tx_recv_err) => {
+                                self.on_err(ChannelPairError::Zmq(z_tx_recv_err));
+                                return;
+                            }
+                        }
+                    }
+
+                    // Handle control messages if there are any
+                    if items[2].is_readable() {
+                        match self.z_control[OUT].recv_multipart(0) {
+                            Ok(_) => {}
+                            Err(ctrl_err) => {
+                                self.on_err(ChannelPairError::Zmq(ctrl_err));
+                                return;
+                            }
+                        }
                     }
                 }
                 Err(poll_err) => {
-                    self.on_err(anyhow!("Polling error: {:?}", poll_err));
+                    self.on_err(ChannelPairError::Zmq(poll_err));
                     return;
                 }
             }
@@ -245,14 +168,13 @@ impl ChannelPair {
                 recv(self.rx_chan()) -> msg => {
                     match msg {
                         Ok(msg) => {
-                            // If a message is received, try to send it through zTx.
                             if let Err(err) = self.z_tx[IN].send_multipart(&msg, 0) {
-                                self.on_err(anyhow!("Failed to send message on tx socket: {:?}", err));
+                                self.on_err(ChannelPairError::Zmq(err));
                                 return;
                             }
                         },
                         Err(_) => {
-                            self.on_err(anyhow!("ZMQ tx channel closed unexpectedly"));
+                            self.on_err(ChannelPairError::ChannelError("ZMQ tx channel closed unexpectedly".into()));
                             return;
                         }
                     }
@@ -261,15 +183,14 @@ impl ChannelPair {
                     match control {
                         Ok(control) => {
                             if control {
-                                // Send an empty message as a control signal.
                                 if let Err(err) = self.z_control[IN].send("", 0) {
-                                    self.on_err(anyhow!("Failed to send message on the control socket: {:?}", err));
+                                    self.on_err(ChannelPairError::Zmq(err));
                                 }
                             }
                             return;
                         },
                         Err(_) => {
-                            self.on_err(anyhow!("ZMQ control channel closed unexpectedly"));
+                            self.on_err(ChannelPairError::ChannelError("ZMQ control channel closed unexpectedly".into()));
                             return;
                         }
                     }
@@ -278,32 +199,36 @@ impl ChannelPair {
         }
     }
 
-    pub fn rx_chan(&self) -> &Receiver<ZmqByteStream> {
+    pub fn rx_chan(&self) -> &Receiver {
         &self.rx_chan
     }
 
-    pub fn tx_chan(&self) -> &Sender<ZmqByteStream> {
+    pub fn tx_chan(&self) -> &Sender {
         &self.tx_chan
     }
 
-    fn tx_control_chan(&self) -> &Sender<bool> {
+    pub fn rx_err_chan(&self) -> &CrossbeamReceiver<ChannelPairError> {
+        &self.error_chan.1
+    }
+
+    fn tx_control_chan(&self) -> &CrossbeamSender<bool> {
         &self.control_chan.0
     }
 
-    fn rx_control_chan(&self) -> &Receiver<bool> {
+    fn rx_control_chan(&self) -> &CrossbeamReceiver<bool> {
         &self.control_chan.1
     }
 
-    fn tx_err_chan(&self) -> &Sender<anyhow::Error> {
+    fn tx_err_chan(&self) -> &CrossbeamSender<ChannelPairError> {
         &self.error_chan.0
     }
 
-    fn on_err(&self, error: anyhow::Error) {
+    fn on_err(&self, error: ChannelPairError) {
         let _ = self.tx_err_chan().send(error);
         let _ = self.tx_control_chan().send(false);
     }
 
-    fn configure_socket(&mut self) -> anyhow::Result<()> {
+    fn configure_socket(&mut self) -> Result<(), ChannelPairError> {
         self.z_sock.set_rcvtimeo(0)?;
         self.z_sock.set_sndtimeo(0)?;
 
@@ -320,7 +245,8 @@ impl ChannelPair {
         Ok(())
     }
 
-    fn new_pair(context: &Context) -> anyhow::Result<Vec<Socket>> {
+    fn new_pair() -> Result<Vec<Socket>, ChannelPairError> {
+        let context = Context::new();
         let addr = format!("inproc://_channelpair_internal-{}", get_unique_id());
         let server_pair = context.socket(zmq::PAIR)?;
         server_pair.bind(&addr)?;
@@ -330,177 +256,101 @@ impl ChannelPair {
 
         Ok(vec![server_pair, client_pair])
     }
-
-    fn disconnect_socket(socket: &Socket) -> Result<(), zmq::Error> {
-        // Retrieve the last endpoint, handling both the outer and inner Result.
-        match socket.get_last_endpoint()? {
-            // Handle the case where the endpoint is a valid UTF-8 string.
-            Ok(endpoint) => socket.disconnect(&endpoint),
-
-            // Handle the case where the endpoint is raw bytes (non-UTF-8).
-            Err(bytes) => {
-                let endpoint = String::from_utf8_lossy(&bytes).into_owned();
-                socket.disconnect(&endpoint)
-            }
-        }
-    }
 }
 
 fn get_unique_id() -> u16 {
     UNIQUE_INDEX.fetch_add(1, Ordering::SeqCst)
 }
 
-// // Helper function to create a new pair socket.
-// fn new_pair_socket() -> (Socket, Context, Socket, Context) {
-//     let ctx1 = Context::new();
-//     let socket1 = ctx1.socket(zmq::PAIR).unwrap();
-//     socket1.bind("tcp://127.0.0.1:9737").unwrap();
-//
-//     let ctx2 = Context::new();
-//     let socket2 = ctx2.socket(zmq::PAIR).unwrap();
-//     socket2.connect("tcp://127.0.0.1:9737").unwrap();
-//
-//     (socket1, ctx1, socket2, ctx2)
-// }
-//
-// // Helper function to compare two ZMQ byte streams.
-// fn msg_equal(a: &ZmqByteStream, b: &ZmqByteStream) -> bool {
-//     if a.len() != b.len() {
-//         return false;
-//     }
-//     for (i, msg) in a.iter().enumerate() {
-//         if msg.len() != b[i].len() {
-//             return false;
-//         }
-//         for (j, byte) in msg.iter().enumerate() {
-//             if *byte != b[i][j] {
-//                 return false;
-//             }
-//         }
-//     }
-//     true
-// }
-//
-// // Helper function to run the echo logic.
-// fn run_echo(num: usize, c: &ChannelPair) {
-//     let mut remaining = num;
-//
-//     while remaining > 0 {
-//         select! {
-//             recv(c.rx_chan()) -> msg => {
-//                 match msg {
-//                     Ok(msg) => {
-//                         // Send the received message back to the Tx channel.
-//                         c.tx_chan().send(msg).expect("Failed to send message");
-//                         remaining -= 1;
-//
-//                         if remaining <= 0 {
-//                             println!("ECHO: done");
-//                             return;
-//                         }
-//                     },
-//                     Err(_) => {
-//                         panic!("Cannot read from echo channel");
-//                     }
-//                 }
-//             },
-//             default(Duration::from_secs(5)) => {
-//                 panic!("Timeout in run_echo");
-//             }
-//         }
-//     }
-// }
-//
-// // Helper function to run the write logic.
-// fn run_write(num: usize, c: &ChannelPair) {
-//     let mut tx = 0;
-//     let mut rx = 0;
-//     let src_msg: ZmqByteStream = vec![b"Hello".to_vec(), b"World".to_vec()];
-//     let mut txchan = Some(c.tx_chan());
-//
-//     while rx < num {
-//         select! {
-//             recv(c.rx_chan()) -> msg => {
-//                 match msg {
-//                     Ok(received_msg) => {
-//                         rx += 1;
-//                         if !msg_equal(&received_msg, &src_msg) {
-//                             panic!("Messages do not match");
-//                         }
-//                         if rx >= num {
-//                             println!("MAIN: done");
-//                             return;
-//                         }
-//                     },
-//                     Err(_) => {
-//                         panic!("Cannot read from main channel");
-//                     }
-//                 }
-//             },
-//             send(txchan.unwrap_or(&c.tx_chan()), src_msg.clone()) -> result => {
-//                 if let Ok(_) = result {
-//                     tx += 1;
-//                     if tx >= num {
-//                         txchan = None; // Disable the txchan (like setting to `nil` in Go)
-//                     }
-//                 }
-//             },
-//             default(Duration::from_secs(1)) => {
-//                 panic!("Timeout in runWrite");
-//             }
-//         }
-//     }
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[test]
-    fn channel_pair() {
-        let (sb, ctx1, sc, ctx2) = new_pair_socket();
-
-        let num: usize = 10;
-        let mut handles = Vec::with_capacity(2);
-
-        {
-            let echo = std::thread::spawn(move || {
-                let cp = ChannelPair::new(ctx1, sb).unwrap();
-                run_echo(num, &cp)
-            });
-            handles.push(echo);
-        }
-
-        {
-            let write = std::thread::spawn(move || {
-                let cc = ChannelPair::new(ctx2, sc).unwrap();
-                run_write(num, &cc);
-            });
-            handles.push(write);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread panicked!");
-        }
-    }
-
-
-    #[test]
-    fn test_channel_pair_basic() {
+    fn channel_pair_test() {
         let ctx = Context::new();
-        let server_socket = ctx.socket(zmq::PAIR).unwrap();
-        let client_socket = ctx.socket(zmq::PAIR).unwrap();
 
-        server_socket.bind("tcp://127.0.0.1:5555").unwrap();
-        client_socket.connect("tcp://127.0.0.1:5555").unwrap();
+        let server_socket = ctx
+            .socket(zmq::ROUTER)
+            .expect("Failed to create ROUTER socket");
+        server_socket
+            .bind("tcp://127.0.0.1:5555")
+            .expect("Failed to bind server socket");
 
-        let cp = ChannelPair::new(ctx, client_socket).unwrap();
+        let processed_messages = Arc::new(Mutex::new(20));
+        let channel_pair = ChannelPair::new(server_socket).expect("Failed to create ChannelPair");
 
-        let msg = vec![b"Hello".to_vec(), b"World".to_vec()];
-        cp.tx_chan().send(msg.clone()).unwrap();
+        // Spawn the server thread
+        let server_processed_messages = Arc::clone(&processed_messages);
+        std::thread::spawn(move || {
+            while *server_processed_messages.lock().unwrap() > 0 {
+                match channel_pair.rx_chan().recv() {
+                    Ok(message) => {
+                        let message_clone = message.clone();
 
-        let received_msg = server_socket.recv_multipart(0).unwrap();
+                        let cp_clone = Arc::clone(&channel_pair);
+                        let server_processed_messages = Arc::clone(&server_processed_messages);
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(2)); // Simulate processing time
 
-        assert!(msg_equal(&msg, &received_msg), "Sent and received messages do not match");
+                            // Send the same message back as the response
+                            cp_clone
+                                .tx_chan()
+                                .send(message_clone)
+                                .expect("Failed to send response");
+
+                            // Decrement the shared counter safely
+                            let mut counter = server_processed_messages.lock().unwrap();
+                            *counter -= 1;
+                        });
+                    }
+                    Err(err) => {
+                        panic!("Server: Timeout receive message: {:?}", err);
+                    }
+                }
+            }
+        });
+
+        // Client logic
+        let client_handle = std::thread::spawn(move || {
+            let client_ctx = Context::new();
+            let client_socket = client_ctx
+                .socket(zmq::DEALER)
+                .expect("Failed to create DEALER socket");
+            client_socket
+                .connect("tcp://127.0.0.1:5555")
+                .expect("Failed to connect client socket");
+            client_socket
+                .set_identity("client-1".as_bytes())
+                .expect("Failed to set client identity");
+
+            let mut num_of_messages_client = 20;
+            while num_of_messages_client >= 0 {
+                // Send a message to the server
+                let msg = vec![b"Hello".to_vec()];
+                client_socket
+                    .send_multipart(&msg, 0)
+                    .expect("Failed to send message from client");
+
+                // Wait for a response from the server
+                match client_socket.recv_multipart(0) {
+                    Ok(_) => {
+                        num_of_messages_client -= 1;
+                    }
+                    Err(e) => panic!("Client: Failed to receive response: {:?}", e),
+                }
+            }
+        });
+
+        client_handle.join().expect("Client thread failed");
+
+        // Check that all messages have been processed
+        assert_eq!(
+            *processed_messages.lock().unwrap(),
+            0,
+            "Not all messages were processed."
+        );
     }
 }

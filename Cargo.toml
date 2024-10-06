@@ -1,9 +1,14 @@
 [package]
-name = "zmq_rchan"
+name = "threadsafe_zmq"
 version = "1.0.0"
 edition = "2021"
+authors = ["Elvis Sabanovic <elvissabanovic3@gmail.com>"]
+description = "Threadsafe zeromq"
+readme = "README.md"
+keywords = ["threadsafe", "zeromq", "sockets", "unix-domain-sockets", "ipc"]
+categories = ["concurrency"]
+repository = "https://github.com/Elvis339/threadsafe_zmq"
 
 [dependencies]
 zmq = "0.10.0"
 crossbeam-channel = "0.5.13"
-anyhow = "1.0.89"
