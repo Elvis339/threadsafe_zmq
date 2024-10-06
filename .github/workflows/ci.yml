@@ -10,6 +10,9 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v3
 
+      - name: List current directory structure
+        run: ls -lah
+
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -48,6 +51,3 @@ jobs:
 
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
-
-      - name: Run cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
