@@ -3,6 +3,8 @@ This implementation is based on Golang's [zmqchan](https://github.com/abligh/zmq
 
 This is just a tweaked implementation in Rust
 
+# Message Flow
+
 ```
                         +-------------------+
                         |     Client        |

@@ -10,16 +10,13 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v3
 
-      - name: List current directory structure
-        run: ls -lah
-
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
 
       - name: Run cargo check
-        run: cargo check --workspace --all-targets
+        run: cargo check
 
   test:
     name: Test Suite
@@ -34,7 +31,7 @@ jobs:
           toolchain: stable
 
       - name: Run cargo test
-        run: cargo test --workspace --all-targets
+        run: cargo test
 
   lints:
     name: Lints

@@ -1,8 +1,0 @@
-[package]
-name = "threadsafe_zmq"
-version = "1.0.0"
-edition = "2021"
-
-[dependencies]
-zmq = "0.10.0"
-crossbeam-channel = "0.5.13"
