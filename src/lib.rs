@@ -386,8 +386,8 @@ mod tests {
     }
 
     fn run_echo(mut num: usize, c: &ChannelPair) {
-        let rx = c.rx_chan();
-        let tx = c.tx_chan();
+        let rx = c.rx();
+        let tx = c.tx();
         let timeout_duration = std::time::Duration::from_secs(1);
         let mut start_time = std::time::Instant::now();
 
