@@ -1,6 +1,6 @@
 [package]
 name = "threadsafe_zmq"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 authors = ["Elvis Sabanovic <elvissabanovic3@gmail.com>"]
 description = "Threadsafe zeromq"
