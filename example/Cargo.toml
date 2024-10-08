@@ -18,3 +18,4 @@ zmq = "0.10.0"
 rand = "0.8.5"
 
 threadsafe_zmq = { path = ".." }
+tokio = { version = "1.40.0", features = ["rt", "rt-multi-thread", "macros"] }
