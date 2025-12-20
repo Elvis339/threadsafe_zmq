@@ -80,21 +80,19 @@ fn run_raw_single_producer(args: &Args) -> (u64, f64) {
     let duration_secs = args.duration_secs;
 
     let running_clone = Arc::clone(&running);
-    let consumer = thread::spawn(move || {
-        loop {
-            match server.recv_multipart(zmq::DONTWAIT) {
-                Ok(m) if m[0] == b"STOP" => break,
-                Ok(_) => {
-                    do_work(work);
-                }
-                Err(zmq::Error::EAGAIN) => {
-                    if !running_clone.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    thread::yield_now();
-                }
-                Err(_) => break,
+    let consumer = thread::spawn(move || loop {
+        match server.recv_multipart(zmq::DONTWAIT) {
+            Ok(m) if m[0] == b"STOP" => break,
+            Ok(_) => {
+                do_work(work);
             }
+            Err(zmq::Error::EAGAIN) => {
+                if !running_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                thread::yield_now();
+            }
+            Err(_) => break,
         }
     });
 
@@ -137,21 +135,19 @@ fn run_raw_mutex(args: &Args) -> (u64, f64) {
     let num_producers = args.workers;
 
     let running_clone = Arc::clone(&running);
-    let consumer = thread::spawn(move || {
-        loop {
-            match server.recv_multipart(zmq::DONTWAIT) {
-                Ok(m) if m[0] == b"STOP" => break,
-                Ok(_) => {
-                    do_work(work);
-                }
-                Err(zmq::Error::EAGAIN) => {
-                    if !running_clone.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    thread::yield_now();
-                }
-                Err(_) => break,
+    let consumer = thread::spawn(move || loop {
+        match server.recv_multipart(zmq::DONTWAIT) {
+            Ok(m) if m[0] == b"STOP" => break,
+            Ok(_) => {
+                do_work(work);
             }
+            Err(zmq::Error::EAGAIN) => {
+                if !running_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                thread::yield_now();
+            }
+            Err(_) => break,
         }
     });
 
@@ -316,17 +312,15 @@ fn run_channelpair(args: &Args) -> (u64, f64) {
 
     let server_clone = Arc::clone(&server);
     let running_clone = Arc::clone(&running);
-    let consumer = thread::spawn(move || {
-        loop {
-            match server_clone.recv_timeout(Duration::from_millis(100)) {
-                Ok(m) if m[0] == b"STOP" => break,
-                Ok(_) => {
-                    do_work(work);
-                }
-                Err(_) => {
-                    if !running_clone.load(Ordering::Relaxed) {
-                        break;
-                    }
+    let consumer = thread::spawn(move || loop {
+        match server_clone.recv_timeout(Duration::from_millis(100)) {
+            Ok(m) if m[0] == b"STOP" => break,
+            Ok(_) => {
+                do_work(work);
+            }
+            Err(_) => {
+                if !running_clone.load(Ordering::Relaxed) {
+                    break;
                 }
             }
         }
@@ -470,18 +464,16 @@ fn run_latency(args: &Args) -> Vec<u64> {
 
     let server_clone = Arc::clone(&server);
     let running_clone = Arc::clone(&running);
-    let worker = thread::spawn(move || {
-        loop {
-            match server_clone.recv_timeout(Duration::from_millis(100)) {
-                Ok(m) if m[0] == b"STOP" => break,
-                Ok(_) => {
-                    do_work(work);
-                    let _ = server_clone.send(vec![b"OK".to_vec()]);
-                }
-                Err(_) => {
-                    if !running_clone.load(Ordering::Relaxed) {
-                        break;
-                    }
+    let worker = thread::spawn(move || loop {
+        match server_clone.recv_timeout(Duration::from_millis(100)) {
+            Ok(m) if m[0] == b"STOP" => break,
+            Ok(_) => {
+                do_work(work);
+                let _ = server_clone.send(vec![b"OK".to_vec()]);
+            }
+            Err(_) => {
+                if !running_clone.load(Ordering::Relaxed) {
+                    break;
                 }
             }
         }
@@ -550,24 +542,40 @@ fn main() {
             // Baseline: what one thread can do
             println!("Raw ZMQ (1 producer, baseline)...");
             let (raw_total, raw_tps) = run_raw_single_producer(&args);
-            println!("{} msg/s ({} total)\n", fmt_num(raw_tps as u64), fmt_num(raw_total));
+            println!(
+                "{} msg/s ({} total)\n",
+                fmt_num(raw_tps as u64),
+                fmt_num(raw_total)
+            );
 
             // Problem 1: mutex contention when sharing socket
             println!("Raw ZMQ + Mutex ({} producers)...", args.workers);
             let (mutex_total, mutex_tps) = run_raw_mutex(&args);
-            println!("{} msg/s ({} total)", fmt_num(mutex_tps as u64), fmt_num(mutex_total));
+            println!(
+                "{} msg/s ({} total)",
+                fmt_num(mutex_tps as u64),
+                fmt_num(mutex_total)
+            );
             println!("vs baseline: {:.2}x\n", mutex_tps / raw_tps);
 
             // Problem 2: proxy pattern adds overhead
             println!("ZMQ Proxy ({} producers, PUSH/PULL)...", args.workers);
             let (proxy_total, proxy_tps) = run_zmq_proxy(&args);
-            println!("{} msg/s ({} total)", fmt_num(proxy_tps as u64), fmt_num(proxy_total));
+            println!(
+                "{} msg/s ({} total)",
+                fmt_num(proxy_tps as u64),
+                fmt_num(proxy_total)
+            );
             println!("vs baseline: {:.2}x\n", proxy_tps / raw_tps);
 
             // Our solution
             println!("ChannelPair ({} producers)...", args.workers);
             let (cp_total, cp_tps) = run_channelpair(&args);
-            println!("{} msg/s ({} total)", fmt_num(cp_tps as u64), fmt_num(cp_total));
+            println!(
+                "{} msg/s ({} total)",
+                fmt_num(cp_tps as u64),
+                fmt_num(cp_total)
+            );
             println!("vs baseline: {:.2}x", cp_tps / raw_tps);
             println!("vs mutex:    {:.2}x", cp_tps / mutex_tps);
             println!("vs proxy:    {:.2}x\n", cp_tps / proxy_tps);
@@ -576,7 +584,11 @@ fn main() {
             {
                 println!("AsyncChannelPair ({} producers)...", args.workers);
                 let (async_total, async_tps) = run_async_channelpair(&args);
-                println!("{} msg/s ({} total)", fmt_num(async_tps as u64), fmt_num(async_total));
+                println!(
+                    "{} msg/s ({} total)",
+                    fmt_num(async_tps as u64),
+                    fmt_num(async_total)
+                );
                 println!("vs baseline: {:.2}x\n", async_tps / raw_tps);
             }
         }
