@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use threadsafe_zmq::ChannelPairBuilder;
 use zmq::Context;
 
-const NUM_SENDERS: usize = 64;
+const NUM_SENDERS: usize = 500;
 const NUM_REQUESTS: usize = NUM_SENDERS * 100;
 const QUEUE_DEPTH: usize = 1000;
 
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut rng = rand::thread_rng();
             for i in 0..requests_per_sender {
                 let req_id = base_id + i as u64;
-                let n: u64 = rng.gen_range(10..=40);
+                let n: u64 = rng.gen_range(10..=30);
 
                 // Record send time
                 {
@@ -59,8 +59,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 channel.send(msg).unwrap();
                 info!("[REQ {}] --> fib({})", req_id, n);
-
-                thread::sleep(Duration::from_millis(50));
             }
         }));
     }

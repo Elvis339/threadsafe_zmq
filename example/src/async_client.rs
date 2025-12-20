@@ -7,7 +7,7 @@ use threadsafe_zmq::AsyncChannelPairBuilder;
 use tokio::sync::Mutex;
 use zmq::Context;
 
-const NUM_SENDERS: usize = 64;
+const NUM_SENDERS: usize = 1000;
 const NUM_REQUESTS: usize = NUM_SENDERS * 100;
 const QUEUE_DEPTH: usize = 1000;
 
@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             for i in 0..requests_per_sender {
                 let req_id = base_id + i as u64;
-                let n: u64 = rng.gen_range(10..=40);
+                let n: u64 = rng.gen_range(10..=30);
 
                 {
                     let mut p = pending.lock().await;
@@ -60,8 +60,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 channel.send(msg).await.unwrap();
                 info!("[REQ {}] --> fib({})", req_id, n);
-
-                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }));
     }
