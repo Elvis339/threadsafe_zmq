@@ -295,10 +295,10 @@ fn run_socket_loop(
             SocketState::ReadyToSend(_) => PollEvents::empty(),
         });
 
-        // Short timeout allows us to check the tokio channel periodically.
-        // 1ms balances responsiveness against CPU usage from polling overhead.
-        // For ultra-low-latency scenarios, consider 0 (busy poll).
-        match zmq::poll(&mut poll_items, 1) {
+        // Use short timeout to check tokio channel frequently.
+        // 0 = busy poll for max throughput (uses more CPU)
+        // Higher values reduce CPU but limit throughput to ~1000/timeout_ms
+        match zmq::poll(&mut poll_items, 0) {
             Ok(_) => {}
             Err(zmq::Error::EINTR) => continue, // Interrupted, retry
             Err(e) => {
@@ -373,10 +373,11 @@ fn run_socket_loop(
         }
 
         // Check tokio channels - these are non-blocking checks
-        // We do this on every iteration to maintain low latency
+        // Batch process all available messages for high throughput
 
         // Check for new outbound messages from user
-        if matches!(state, SocketState::Idle) {
+        // Drain the channel to maximize throughput - don't wait for next poll
+        while matches!(state, SocketState::Idle) {
             match rx_from_user.try_recv() {
                 Ok(msg) => {
                     // Forward through the internal socket pair.
@@ -387,11 +388,11 @@ fn run_socket_loop(
                             is_shutdown.store(true, Ordering::SeqCst);
                             return;
                         }
-                        // EAGAIN on internal socket is unexpected but handle gracefully
+                        // EAGAIN on internal socket - buffer for next round
                         state = SocketState::ReadyToSend(msg);
                     }
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     // Sender dropped - initiate graceful shutdown
                     handle_shutdown(&socket, &mut state, &mut rx_from_user, &z_tx_pair, true);
