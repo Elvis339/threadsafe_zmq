@@ -501,7 +501,7 @@ fn run_latency(args: &Args) -> Vec<u64> {
     latencies
 }
 
-fn print_latency_stats(latencies: &mut Vec<u64>) {
+fn print_latency_stats(latencies: &mut [u64]) {
     if latencies.is_empty() {
         return;
     }
