@@ -1,6 +1,13 @@
-on: [push, pull_request]
-
 name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   check:
@@ -8,43 +15,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
 
-      - name: Run cargo check
-        run: cargo check
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
 
-  test:
-    name: Test Suite
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v3
-
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-
-      - name: Run cargo test
-        run: cargo test
-
-  lints:
-    name: Lints
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v3
-
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-
-      - name: Run cargo fmt
-        run: cargo fmt --all -- --check
+      - name: Run checks (fmt, lint, test)
+        run: nix develop --command just check
