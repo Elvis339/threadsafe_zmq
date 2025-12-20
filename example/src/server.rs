@@ -1,68 +1,104 @@
-use env_logger;
+//! Fibonacci server with request tracing.
+
+use crossbeam_channel::bounded;
 use log::{error, info};
 use std::sync::Arc;
-use threadsafe_zmq::{ChannelPair, ZmqByteStream};
-use tokio::task;
+use std::thread;
+use threadsafe_zmq::{ChannelPairBuilder, ZmqMessage};
 use zmq::Context;
 
-mod utils;
-use crate::utils::to_string;
+const NUM_WORKERS: usize = 10;
+const QUEUE_DEPTH: usize = 1000;
 
-#[tokio::main]
-async fn main() {
-    env_logger::init();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let addr = "tcp://*:5555";
     let ctx = Context::new();
-    let socket = ctx
-        .socket(zmq::ROUTER)
-        .expect("Failed to create ROUTER socket");
-    socket.bind(addr).expect("Failed to bind to address");
+    let socket = ctx.socket(zmq::ROUTER)?;
+    socket.bind("tcp://*:5555")?;
 
-    let channel_pair = ChannelPair::new(&ctx, socket).expect("Failed to create channel pair");
-    info!("Server listening on {}", addr);
+    let channel = ChannelPairBuilder::new(&ctx, socket)
+        .with_bounded_queue(QUEUE_DEPTH)
+        .build()?;
+
+    info!("Listening on tcp://*:5555 | workers={}", NUM_WORKERS);
+
+    let (work_tx, work_rx) = bounded::<ZmqMessage>(QUEUE_DEPTH);
+
+    let mut workers = Vec::new();
+    for id in 0..NUM_WORKERS {
+        let channel = Arc::clone(&channel);
+        let work_rx = work_rx.clone();
+
+        workers.push(thread::spawn(move || {
+            worker_loop(id, channel, work_rx);
+        }));
+    }
+
     loop {
-        let channel_pair_clone = Arc::clone(&channel_pair);
-        match task::spawn_blocking(move || channel_pair_clone.rx().recv()).await {
-            Ok(Ok(message)) => {
-                let channel_pair_for_task = Arc::clone(&channel_pair);
-                task::spawn(handle_message(message, channel_pair_for_task));
-            }
-            Ok(Err(e)) => {
-                error!("Failed to receive message: {:?}", e);
-                break;
+        match channel.recv() {
+            Ok(message) => {
+                if work_tx.send(message).is_err() {
+                    break;
+                }
             }
             Err(e) => {
-                error!("Task join error: {:?}", e);
+                error!("Receive error: {}", e);
                 break;
             }
         }
     }
+
+    drop(work_tx);
+    for w in workers {
+        let _ = w.join();
+    }
+
+    channel.shutdown();
+    Ok(())
 }
 
-async fn handle_message(messages: ZmqByteStream, channel_pair: Arc<ChannelPair>) {
-    let identity = messages[0].clone();
+fn worker_loop(
+    id: usize,
+    channel: Arc<threadsafe_zmq::ChannelPair>,
+    work_rx: crossbeam_channel::Receiver<ZmqMessage>,
+) {
+    while let Ok(message) = work_rx.recv() {
+        if message.len() < 2 {
+            continue;
+        }
 
-    if let Ok(str_num) = String::from_utf8(messages.last().unwrap().clone()) {
-        if let Ok(number) = str_num.parse::<u64>() {
-            let result = task::spawn_blocking(move || fibonacci(number)).await;
+        let identity = message[0].clone();
+        let payload = match message.last() {
+            Some(p) => p,
+            None => continue,
+        };
 
-            match result {
-                Ok(result) => {
-                    let result_bytes = to_string(result);
-                    if let Err(err) = channel_pair
-                        .tx()
-                        .send(vec![identity.clone(), result_bytes.as_bytes().to_vec()])
-                    {
-                        error!("Failed to send response: {:?}", err);
-                    } else {
-                        info!("SND: fib({})={}", number, result);
-                    }
-                }
-                Err(e) => {
-                    error!("Task join error while calculating fibonacci({}): {:?}", number, e);
-                }
-            }
+        let payload_str = match String::from_utf8(payload.clone()) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // Parse "req_id:fib_n"
+        let parts: Vec<&str> = payload_str.trim().split(':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+
+        let req_id: u64 = parts[0].parse().unwrap_or(0);
+        let n: u64 = parts[1].parse().unwrap_or(0);
+
+        let result = fibonacci(n);
+
+        info!("[W{}] REQ {} fib({}) = {}", id, req_id, n, result);
+
+        // Response: "req_id:result"
+        let response_payload = format!("{}:{}", req_id, result);
+        let response = vec![identity, response_payload.into_bytes()];
+
+        if let Err(e) = channel.send(response) {
+            error!("[W{}] Send error: {}", id, e);
+            break;
         }
     }
 }
@@ -76,7 +112,7 @@ fn fibonacci(n: u64) -> u64 {
     let mut b: u64 = 1;
 
     for _ in 2..=n {
-        let temp = a + b;
+        let temp = a.saturating_add(b);
         a = b;
         b = temp;
     }

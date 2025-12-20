@@ -2,6 +2,7 @@
 name = "threadsafe_zmq_example"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [[bin]]
 name = "client"
@@ -11,11 +12,19 @@ path = "src/client.rs"
 name = "server"
 path = "src/server.rs"
 
+[[bin]]
+name = "async_client"
+path = "src/async_client.rs"
+
+[[bin]]
+name = "async_server"
+path = "src/async_server.rs"
+
 [dependencies]
 log = "0.4"
-env_logger = "0.11.5"
+env_logger = "0.11"
 zmq = "0.10.0"
-rand = "0.8.5"
-
-threadsafe_zmq = { path = ".." }
-tokio = { version = "1.40.0", features = ["rt", "rt-multi-thread", "macros"] }
+rand = "0.8"
+crossbeam-channel = "0.5"
+threadsafe_zmq = { path = "..", features = ["async"] }
+tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
