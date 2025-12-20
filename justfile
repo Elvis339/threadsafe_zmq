@@ -21,35 +21,57 @@ check: fmt-check lint test
 doc:
     cargo doc --all-features --no-deps --open
 
-# Run the example server (in foreground)
+# Run benchmark
+bench:
+    cargo run --release --features bench,async --bin bench
+
+# Sync server (port 5555)
 server:
     cd example && RUST_LOG=info cargo run --bin server
 
-# Run the example client
+# Sync client
 client:
     cd example && RUST_LOG=info cargo run --bin client
 
-# Run example: starts server in background, runs client, then stops server
+# Async server (port 5556)
+async-server:
+    cd example && RUST_LOG=info cargo run --bin async_server
+
+# Async client
+async-client:
+    cd example && RUST_LOG=info cargo run --bin async_client
+
+# Run sync example
 example:
     #!/usr/bin/env bash
     set -e
-    echo "Building examples..."
     cd example && cargo build
-    echo ""
-    echo "Starting server in background..."
+    echo "Starting sync server..."
     RUST_LOG=info cargo run --bin server &
     SERVER_PID=$!
     sleep 2
-    echo ""
-    echo "Running client..."
+    echo "Running sync client..."
     RUST_LOG=info cargo run --bin client || true
-    echo ""
     echo "Stopping server..."
     kill $SERVER_PID 2>/dev/null || true
     wait $SERVER_PID 2>/dev/null || true
-    echo "Done."
 
-# Install nix (for systems without it)
+# Run async example
+example-async:
+    #!/usr/bin/env bash
+    set -e
+    cd example && cargo build
+    echo "Starting async server..."
+    RUST_LOG=info cargo run --bin async_server &
+    SERVER_PID=$!
+    sleep 2
+    echo "Running async client..."
+    RUST_LOG=info cargo run --bin async_client || true
+    echo "Stopping server..."
+    kill $SERVER_PID 2>/dev/null || true
+    wait $SERVER_PID 2>/dev/null || true
+
+# Install nix
 install-nix:
     #!/usr/bin/env bash
     if command -v nix &> /dev/null; then
@@ -58,20 +80,16 @@ install-nix:
     else
         echo "Installing Nix..."
         curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
-        echo ""
-        echo "Nix installed. Please restart your shell or run:"
-        echo "  . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh"
     fi
 
-# Enter nix development shell
+# Enter nix shell
 shell:
     nix develop
 
-# Publish to crates.io (dry run)
+# Publish dry run
 publish-dry:
     cargo publish --dry-run --all-features
 
 # Publish to crates.io
 publish:
     cargo publish --all-features
-

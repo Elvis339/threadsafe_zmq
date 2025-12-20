@@ -14,11 +14,14 @@ rust-version = "1.70"
 [features]
 default = []
 async = ["tokio"]
+bench = ["clap", "core_affinity"]
 
 [dependencies]
 zmq = "0.10.0"
 crossbeam-channel = "0.5.13"
-tokio = { version = "1.40", features = ["sync", "rt", "time"], optional = true }
+tokio = { version = "1.40", features = ["sync", "rt", "rt-multi-thread", "time"], optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+core_affinity = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["sync", "rt", "rt-multi-thread", "time", "macros"] }
@@ -26,3 +29,8 @@ tokio = { version = "1.40", features = ["sync", "rt", "rt-multi-thread", "time",
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+required-features = ["bench"]

@@ -12,12 +12,19 @@ path = "src/client.rs"
 name = "server"
 path = "src/server.rs"
 
+[[bin]]
+name = "async_client"
+path = "src/async_client.rs"
+
+[[bin]]
+name = "async_server"
+path = "src/async_server.rs"
+
 [dependencies]
 log = "0.4"
 env_logger = "0.11"
 zmq = "0.10.0"
 rand = "0.8"
 crossbeam-channel = "0.5"
-
 threadsafe_zmq = { path = "..", features = ["async"] }
 tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }

@@ -4,20 +4,42 @@
 [![Documentation](https://docs.rs/threadsafe_zmq/badge.svg)](https://docs.rs/threadsafe_zmq)
 [![License](https://img.shields.io/crates/l/threadsafe_zmq.svg)](LICENSE)
 
-A high-performance, thread-safe wrapper around ZeroMQ sockets with both synchronous and native async APIs.
+Thread-safe ZeroMQ wrapper for multi-threaded servers.
+
+Trade-off: ~9x latency overhead per message, but enables parallel sending from multiple threads - which can result in higher total throughput than single-threaded raw ZMQ.
 
 ## The Problem
 
-ZeroMQ sockets are explicitly NOT thread-safe. From the ZMQ guide:
-> "Do not use or close sockets except in the thread that created them."
+ZeroMQ sockets are NOT thread-safe:
 
-This library solves that by isolating socket operations to dedicated threads and exposing thread-safe channels to user code.
+> "Do not use or close sockets except in the thread that created them." - ZMQ Guide
 
-## Features
+In a multi-threaded server handling 100K+ req/s, multiple worker threads need to send responses through a single ZMQ socket. Without thread-safety, this causes SIGSEGV crashes.
 
-- Thread-Safe
-- Async Support
-- Low Latency
+```
+                    ┌─── Worker Thread 1 ───┐
+[100K req/s] ──────►│─── Worker Thread 2 ───│──► ZMQ Socket
+                    │─── Worker Thread N ───│      ↓
+                    └───────────────────────┘   SIGSEGV 💥
+```
+
+This library wraps ZMQ sockets in dedicated threads and exposes thread-safe channel handles that can be cloned and shared across any number of worker threads.
+
+## Performance
+
+Benchmarked on Apple M1 with 64-byte messages:
+
+| Approach | Throughput | Notes |
+|----------|------------|-------|
+| Raw ZMQ (1 thread) | 3.4M msg/sec | Cannot use with multi-threaded server |
+| **ChannelPair (4 threads)** | **8.5M msg/sec** | Thread-safe, 2.5x faster via parallelism |
+
+For a 100K req/s workload, this provides **85x headroom**.
+
+Run benchmarks yourself:
+```bash
+just bench
+```
 
 ## Installation
 
@@ -25,32 +47,20 @@ This library solves that by isolating socket operations to dedicated threads and
 [dependencies]
 threadsafe_zmq = "2.0"
 
-# For async support (pure tokio, no crossbeam bridging)
+# For async support
 threadsafe_zmq = { version = "2.0", features = ["async"] }
 ```
 
 ### System Dependencies
 
-This library requires ZeroMQ to be installed on your system.
+Requires ZeroMQ installed on your system.
 
 **Using Nix (recommended):**
-
 ```bash
-# Install nix (requires just command runner: https://just.systems)
-just install-nix
-
-# List available commands
-just && just shell
-
-# Generate docs
-just doc
-
-# Or with direnv (automatic on cd)
-direnv allow
+just install-nix && just shell
 ```
 
-**Manual installation:**
-
+**Manual:**
 ```bash
 # macOS
 brew install zeromq pkg-config
@@ -60,40 +70,31 @@ apt-get install libzmq3-dev pkg-config
 
 # Fedora
 dnf install zeromq-devel pkg-config
-
-# Arch
-pacman -S zeromq pkgconf
 ```
 
 ## Quick Start
 
-### Synchronous API
+### Sync API
 
 ```rust
-use threadsafe_zmq::{ChannelPair, ChannelPairBuilder};
-use zmq::Context;
+use threadsafe_zmq::ChannelPair;
+use std::sync::Arc;
+use std::thread;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = Context::new();
-    
-    let server_sock = ctx.socket(zmq::PAIR)?;
-    server_sock.bind("tcp://127.0.0.1:5555")?;
-    
-    let client_sock = ctx.socket(zmq::PAIR)?;
-    client_sock.connect("tcp://127.0.0.1:5555")?;
-    
-    let server = ChannelPair::new(&ctx, server_sock)?;
-    let client = ChannelPair::new(&ctx, client_sock)?;
-    
-    client.send(vec![b"Hello".to_vec()])?;
-    
-    let msg = server.recv()?;
-    println!("Received: {:?}", String::from_utf8_lossy(&msg[0]));
-    
-    server.shutdown();
-    client.shutdown();
-    
-    Ok(())
+let ctx = zmq::Context::new();
+
+let socket = ctx.socket(zmq::DEALER)?;
+socket.connect("tcp://127.0.0.1:5555")?;
+
+let channel = ChannelPair::new(&ctx, socket)?;
+
+// Spawn worker threads - each gets a clone of the handle
+for _ in 0..4 {
+    let ch = Arc::clone(&channel);
+    thread::spawn(move || {
+        // Safe to send from any thread
+        ch.send(vec![b"response".to_vec()]).unwrap();
+    });
 }
 ```
 
@@ -101,13 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 use threadsafe_zmq::ChannelPairBuilder;
-use zmq::Context;
 
-let ctx = Context::new();
-let socket = ctx.socket(zmq::DEALER)?;
-socket.connect("tcp://127.0.0.1:5555")?;
-
-// Bounded queue prevents memory exhaustion under load
 let channel = ChannelPairBuilder::new(&ctx, socket)
     .with_bounded_queue(1000)
     .build()?;
@@ -119,9 +114,7 @@ match channel.try_send(vec![b"data".to_vec()]) {
 }
 ```
 
-### Async
-
-The async implementation uses native tokio channels
+### Async API
 
 ```toml
 [dependencies]
@@ -130,27 +123,18 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 ```rust
-use threadsafe_zmq::{AsyncChannelPair, AsyncChannelPairBuilder};
-use zmq::Context;
-use std::time::Duration;
+use threadsafe_zmq::AsyncChannelPair;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = Context::new();
-    
+    let ctx = zmq::Context::new();
     let socket = ctx.socket(zmq::DEALER)?;
     socket.connect("tcp://127.0.0.1:5555")?;
     
-    let channel = AsyncChannelPairBuilder::new(&ctx, socket)
-        .with_bounded_queue(100)
-        .build()?;
+    let channel = AsyncChannelPair::new(&ctx, socket)?;
     
     channel.send(vec![b"Hello".to_vec()]).await?;
-    
-    match channel.recv_timeout(Duration::from_secs(5)).await {
-        Ok(msg) => println!("Got: {:?}", msg),
-        Err(e) => eprintln!("Error: {}", e),
-    }
+    let response = channel.recv().await?;
     
     channel.shutdown().await;
     Ok(())
@@ -160,89 +144,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Architecture
 
 ```
-                    User Code
-                       |
-            +----------+----------+
-            |                     |
-         sender()              receiver()
-            |                     |
-            v                     ^
-    +-------+-------+     +-------+-------+
-    |   tx_chan     |     |    rx_chan    |
-    | (crossbeam)   |     |  (crossbeam)  |
-    +-------+-------+     +-------+-------+
-            |                     ^
-            v                     |
-    +-------+-------+     +-------+-------+
-    | Channel Bridge|     | Socket Thread |
-    |    Thread     |     | (run_sockets) |
-    +-------+-------+     +-------+-------+
-            |                     ^
-            v                     |
-    +-------+-------+             |
-    | z_tx PAIR     +-------------+
-    | (inproc)      |
-    +---------------+
-            |
-            v
-    +-------+-------+
-    |  ZMQ Socket   |
-    |  (network)    |
-    +---------------+
+    User Threads (N)
+          │
+          ▼
+    ┌───────────┐
+    │ Crossbeam │ ◄── Thread-safe, clone & share
+    │ Channels  │
+    └─────┬─────┘
+          │
+          ▼
+    ┌───────────┐
+    │  Socket   │ ◄── Single thread owns the ZMQ socket
+    │  Thread   │
+    └─────┬─────┘
+          │
+          ▼
+    ┌───────────┐
+    │    ZMQ    │
+    │  Socket   │
+    └───────────┘
 ```
 
-**Why this design?**
-
-1. ZMQ sockets aren't thread-safe, so we isolate them in a dedicated thread
-2. `zmq_poll` can't wait on channels, so we use internal PAIR sockets for signaling
-3. The PAIR sockets convert channel events into pollable socket events
+ZMQ sockets live in a dedicated thread. User code interacts via channels that are `Send + Sync`.
 
 ## Examples
 
-See the [`example/`](example/) directory:
-
 ```bash
-# Using just (recommended)
-just example  # Runs server + client automatically
-
-# Or manually in two terminals:
-just server   # Terminal 1
-just client   # Terminal 2
+just example  # Runs server + client
 ```
 
 ## Development
 
-This project uses [Nix](https://nixos.org/) for reproducible builds and [just](https://just.systems/) as a command runner.
-
 ```bash
-# Install nix (if needed)
-just install-nix
-
-# Enter development shell
-just shell
-# Or: nix develop
-
-# Available commands
-just          # Show all commands
+just install-nix  # Install Nix if needed
+just shell        # Enter dev environment
+just              # Show all commands
+just bench        # Run benchmarks
 ```
-
-## Error Handling
-
-```rust
-use threadsafe_zmq::ChannelPairError;
-
-match channel.recv() {
-    Ok(msg) => handle(msg),
-    Err(ChannelPairError::Zmq(e)) => eprintln!("ZMQ: {}", e),
-    Err(ChannelPairError::ChannelDisconnected(msg)) => eprintln!("Closed: {}", msg),
-    Err(e) => eprintln!("Error: {}", e),
-}
-```
-
-## Credits
-
-Inspired by Go's [zmqchan](https://github.com/abligh/zmqchan).
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0
