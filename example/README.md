@@ -4,8 +4,8 @@
 
 Multi-threaded server/client using `ChannelPair`:
 
-- **Server**: 8 worker threads processing requests in parallel
-- **Client**: 8 sender threads, 100 total requests
+- Server: 10 worker threads
+- Client: 64 sender threads, 6400 requests
 - Port: 5555
 
 ```bash
@@ -20,8 +20,8 @@ RUST_LOG=info cargo run --bin client
 
 Tokio-based server/client using `AsyncChannelPair`:
 
-- **Server**: 100 concurrent tasks via semaphore
-- **Client**: 8 sender tasks, 100 total requests
+- Server: 100 concurrent tasks
+- Client: 64 sender tasks, 6400 requests
 - Port: 5556
 
 ```bash
