@@ -73,16 +73,11 @@ pub type ZmqMessage = Vec<Vec<u8>>;
 /// **Bounded**: Provides backpressure - fast producers slow down when
 /// consumers can't keep up. Use when: you need predictable memory usage,
 /// or want to surface performance problems early rather than OOM-ing later.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum ChannelCapacity {
+    #[default]
     Unbounded,
     Bounded(usize),
-}
-
-impl Default for ChannelCapacity {
-    fn default() -> Self {
-        Self::Unbounded
-    }
 }
 
 /// Cloneable handle for sending messages.
